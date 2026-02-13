@@ -1,0 +1,107 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [vector]
+}
+
+enum ThoughtType {
+  task
+  idea
+  note
+  reminder
+  journal
+}
+
+enum ThoughtStatus {
+  active
+  done
+  snoozed
+  archived
+}
+
+model User {
+  id            String         @id @default(uuid()) @db.Uuid
+  email         String         @unique @db.VarChar(255)
+  name          String?        @db.VarChar(255)
+  preferences   Json           @default("{}")
+  createdAt     DateTime       @default(now()) @map("created_at") @db.Timestamptz()
+  thoughts      Thought[]
+  notifications Notification[]
+
+  @@map("users")
+}
+
+model Thought {
+  id              String        @id @default(uuid()) @db.Uuid
+  userId          String        @map("user_id") @db.Uuid
+  rawTranscript   String        @map("raw_transcript")
+  cleanedText     String        @map("cleaned_text")
+  summary         String?
+  type            ThoughtType
+  priority        Int           @default(3)
+  categories      String[]      @default([])
+  sentiment       Float?
+  entities        Json          @default("{}")
+  actionItems     String[]      @default([]) @map("action_items")
+  deadline        DateTime?     @db.Timestamptz()
+  completedAt     DateTime?     @map("completed_at") @db.Timestamptz()
+  snoozedUntil    DateTime?     @map("snoozed_until") @db.Timestamptz()
+  status          ThoughtStatus @default(active)
+  // embedding handled via raw SQL (pgvector)
+  embedding       Unsupported("vector(1536)")?
+  audioUrl        String?       @map("audio_url")
+  audioDuration   Float?        @map("audio_duration_seconds")
+  language        String        @default("cs") @db.VarChar(5)
+  source          String        @default("voice") @db.VarChar(20)
+  createdAt       DateTime      @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt       DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz()
+
+  user            User          @relation(fields: [userId], references: [id])
+  notifications   Notification[]
+  connectionsA    ThoughtConnection[] @relation("ThoughtA")
+  connectionsB    ThoughtConnection[] @relation("ThoughtB")
+
+  @@index([userId, status])
+  @@index([userId, type])
+  @@index([deadline])
+  @@map("thoughts")
+}
+
+model ThoughtConnection {
+  id             String   @id @default(uuid()) @db.Uuid
+  thoughtAId     String   @map("thought_a_id") @db.Uuid
+  thoughtBId     String   @map("thought_b_id") @db.Uuid
+  similarity     Float
+  connectionType String   @default("semantic") @map("connection_type") @db.VarChar(20)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  thoughtA       Thought  @relation("ThoughtA", fields: [thoughtAId], references: [id], onDelete: Cascade)
+  thoughtB       Thought  @relation("ThoughtB", fields: [thoughtBId], references: [id], onDelete: Cascade)
+
+  @@unique([thoughtAId, thoughtBId])
+  @@map("thought_connections")
+}
+
+model Notification {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String    @map("user_id") @db.Uuid
+  thoughtId    String?   @map("thought_id") @db.Uuid
+  type         String    @db.VarChar(20)
+  title        String
+  body         String?
+  scheduledFor DateTime  @map("scheduled_for") @db.Timestamptz()
+  sentAt       DateTime? @map("sent_at") @db.Timestamptz()
+  dismissedAt  DateTime? @map("dismissed_at") @db.Timestamptz()
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+
+  user         User      @relation(fields: [userId], references: [id])
+  thought      Thought?  @relation(fields: [thoughtId], references: [id])
+
+  @@index([userId, scheduledFor])
+  @@map("notifications")
+}

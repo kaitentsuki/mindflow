@@ -1,0 +1,21 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: mindflow-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mindflow
+      POSTGRES_PASSWORD: mindflow
+      POSTGRES_DB: mindflow
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mindflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
