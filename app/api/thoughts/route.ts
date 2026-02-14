@@ -21,6 +21,10 @@ export async function GET(request: NextRequest) {
   const status = searchParams.get("status") || "active";
   const limit = parseInt(searchParams.get("limit") || "50");
   const offset = parseInt(searchParams.get("offset") || "0");
+  const priority = searchParams.get("priority");
+  const category = searchParams.get("category");
+  const dateFrom = searchParams.get("dateFrom");
+  const dateTo = searchParams.get("dateTo");
 
   const userId = await getUserId(request);
 
@@ -28,6 +32,14 @@ export async function GET(request: NextRequest) {
   if (userId) where.userId = userId;
   if (type) where.type = type;
   if (status) where.status = status;
+  if (priority) where.priority = { gte: parseInt(priority) };
+  if (category) where.categories = { has: category };
+  if (dateFrom || dateTo) {
+    const createdAt: Record<string, Date> = {};
+    if (dateFrom) createdAt.gte = new Date(dateFrom);
+    if (dateTo) createdAt.lte = new Date(dateTo);
+    where.createdAt = createdAt;
+  }
 
   const [thoughts, total] = await Promise.all([
     prisma.thought.findMany({

@@ -24,6 +24,18 @@ export async function PATCH(
   const { id } = await params;
   const body = await request.json();
 
+  // Determine snoozedUntil logic
+  let snoozedUntilValue: Date | null | undefined = undefined;
+  if (body.snoozedUntil !== undefined) {
+    snoozedUntilValue = body.snoozedUntil ? new Date(body.snoozedUntil) : null;
+  } else if (body.status === "snoozed") {
+    // Default snooze to 1 hour if no explicit snoozedUntil
+    snoozedUntilValue = new Date(Date.now() + 3600000);
+  } else if (body.status !== undefined && body.status !== "snoozed") {
+    // Clear snoozedUntil when moving away from snoozed
+    snoozedUntilValue = null;
+  }
+
   const thought = await prisma.thought.update({
     where: { id },
     data: {
@@ -37,6 +49,7 @@ export async function PATCH(
         deadline: body.deadline ? new Date(body.deadline) : null,
       }),
       ...(body.status === "done" && { completedAt: new Date() }),
+      ...(snoozedUntilValue !== undefined && { snoozedUntil: snoozedUntilValue }),
     },
   });
 

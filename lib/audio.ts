@@ -53,9 +53,11 @@ export class AudioCapture {
     try {
       this.stream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          sampleRate: 16000,
+          // Browser audio processing degrades STT quality — STT models handle noise better
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: true,
+          channelCount: 1,
         },
       });
 
@@ -77,7 +79,8 @@ export class AudioCapture {
         }
       };
 
-      this.mediaRecorder.start(1000); // collect data every second
+      // No timeslice — single valid file on stop (avoids corrupted WebM from chunk concat)
+      this.mediaRecorder.start();
       this.startTime = Date.now();
       this._state = "recording";
     } catch (error) {
@@ -133,6 +136,23 @@ export class AudioCapture {
 
       this.mediaRecorder.stop();
     });
+  }
+
+  /**
+   * Get the AnalyserNode for external visualization (e.g. WaveformVisualizer).
+   */
+  getAnalyser(): AnalyserNode | null {
+    return this.analyser;
+  }
+
+  /**
+   * Get frequency data array from the analyser.
+   */
+  getFrequencyData(): Uint8Array {
+    if (!this.analyser) return new Uint8Array(0);
+    const data = new Uint8Array(this.analyser.frequencyBinCount);
+    this.analyser.getByteFrequencyData(data);
+    return data;
   }
 
   /**

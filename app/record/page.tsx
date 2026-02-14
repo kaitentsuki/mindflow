@@ -2,6 +2,10 @@
 
 import { useState, useRef, useEffect, useCallback } from "react";
 import { AudioCapture } from "@/lib/audio";
+import { ContinuousRecording } from "@/lib/continuous-recording";
+import { WaveformVisualizer } from "@/components/WaveformVisualizer";
+
+type RecordingMode = "single" | "continuous";
 
 type PageStatus =
   | "idle"
@@ -20,6 +24,13 @@ interface TranscriptResult {
   confidence: number;
 }
 
+interface ContinuousSegment {
+  id: number;
+  text: string | null;
+  status: "transcribing" | "done" | "error";
+  duration: number;
+}
+
 export default function RecordPage() {
   const [status, setStatus] = useState<PageStatus>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -27,14 +38,22 @@ export default function RecordPage() {
   const [elapsed, setElapsed] = useState(0);
   const [audioLevel, setAudioLevel] = useState(0);
   const [permissionDenied, setPermissionDenied] = useState(false);
+  const [language, setLanguage] = useState("cs");
+  const [mode, setMode] = useState<RecordingMode>("single");
+  const [analyserNode, setAnalyserNode] = useState<AnalyserNode | null>(null);
+  const [segments, setSegments] = useState<ContinuousSegment[]>([]);
   const captureRef = useRef<AudioCapture | null>(null);
+  const continuousRef = useRef<ContinuousRecording | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const levelRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const audioBlobRef = useRef<Blob | null>(null);
+  const segmentIdRef = useRef(0);
 
   // Clean up on unmount
   useEffect(() => {
     return () => {
       captureRef.current?.cancel();
+      continuousRef.current?.stop();
       if (timerRef.current) clearInterval(timerRef.current);
       if (levelRef.current) clearInterval(levelRef.current);
     };
@@ -64,16 +83,31 @@ export default function RecordPage() {
     }
   }, []);
 
+  const uploadAudio = async (blob: Blob, thoughtId: string) => {
+    try {
+      const formData = new FormData();
+      const ext = blob.type.includes("mp4") ? "m4a" : "webm";
+      formData.append("audio", blob, `recording.${ext}`);
+      formData.append("thoughtId", thoughtId);
+      await fetch("/api/audio/upload", { method: "POST", body: formData });
+    } catch {
+      console.error("[record] Failed to upload audio data");
+    }
+  };
+
+  // --- Single-shot mode ---
   const handleStart = async () => {
     setError(null);
     setTranscript(null);
     setPermissionDenied(false);
+    audioBlobRef.current = null;
 
     const capture = new AudioCapture();
     captureRef.current = capture;
 
     try {
       await capture.start();
+      setAnalyserNode(capture.getAnalyser());
       setStatus("recording");
       startTimers();
     } catch (err) {
@@ -112,12 +146,17 @@ export default function RecordPage() {
     try {
       setStatus("uploading");
       const result = await capture.stop();
+      setAnalyserNode(null);
+      audioBlobRef.current = result.blob;
+
+      console.log(`[record] Audio: ${result.mimeType} | ${(result.blob.size / 1024).toFixed(1)} KB | ${(result.durationMs / 1000).toFixed(1)}s`);
 
       // Upload to transcribe API
       setStatus("transcribing");
       const formData = new FormData();
       const ext = result.mimeType.includes("mp4") ? "m4a" : "webm";
       formData.append("audio", result.blob, `recording.${ext}`);
+      formData.append("language", language);
 
       const response = await fetch("/api/transcribe", {
         method: "POST",
@@ -140,13 +179,19 @@ export default function RecordPage() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             rawTranscript: transcriptData.text,
-            language: transcriptData.language,
+            language: transcriptData.language || language,
             source: "voice",
             audioDuration: result.durationMs / 1000,
           }),
         });
 
-        if (!thoughtResponse.ok) {
+        if (thoughtResponse.ok) {
+          const thoughtData = await thoughtResponse.json();
+          // Upload audio data to the thought
+          if (audioBlobRef.current && thoughtData.id) {
+            await uploadAudio(audioBlobRef.current, thoughtData.id);
+          }
+        } else {
           console.error("Failed to save thought, but transcript is available");
         }
       }
@@ -162,9 +207,98 @@ export default function RecordPage() {
   const handleCancel = () => {
     captureRef.current?.cancel();
     stopTimers();
+    setAnalyserNode(null);
     setStatus("idle");
     setElapsed(0);
     setAudioLevel(0);
+  };
+
+  // --- Continuous mode ---
+  const handleContinuousStart = async () => {
+    setError(null);
+    setSegments([]);
+    setPermissionDenied(false);
+
+    const onSegment = async (blob: Blob, duration: number) => {
+      const id = ++segmentIdRef.current;
+      setSegments((prev) => [
+        ...prev,
+        { id, text: null, status: "transcribing", duration },
+      ]);
+
+      try {
+        const formData = new FormData();
+        const ext = blob.type.includes("mp4") ? "m4a" : "webm";
+        formData.append("audio", blob, `segment-${id}.${ext}`);
+        formData.append("language", language);
+
+        const response = await fetch("/api/transcribe", {
+          method: "POST",
+          body: formData,
+        });
+
+        if (!response.ok) throw new Error("Transcription failed");
+
+        const data: TranscriptResult = await response.json();
+
+        if (data.text.trim()) {
+          // Save as thought
+          const thoughtRes = await fetch("/api/thoughts", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              rawTranscript: data.text,
+              language: data.language || language,
+              source: "voice",
+              audioDuration: duration / 1000,
+            }),
+          });
+
+          if (thoughtRes.ok) {
+            const thoughtData = await thoughtRes.json();
+            await uploadAudio(blob, thoughtData.id);
+          }
+        }
+
+        setSegments((prev) =>
+          prev.map((s) =>
+            s.id === id
+              ? { ...s, text: data.text || "(empty)", status: "done" as const }
+              : s
+          )
+        );
+      } catch {
+        setSegments((prev) =>
+          prev.map((s) =>
+            s.id === id ? { ...s, text: "Error", status: "error" as const } : s
+          )
+        );
+      }
+    };
+
+    const continuous = new ContinuousRecording(onSegment, language);
+    continuousRef.current = continuous;
+
+    try {
+      await continuous.start();
+      setAnalyserNode(continuous.getAnalyser());
+      setStatus("recording");
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "NotAllowedError") {
+        setPermissionDenied(true);
+        setError("Microphone access denied.");
+      } else {
+        setError("Failed to start continuous recording.");
+      }
+      setStatus("error");
+    }
+  };
+
+  const handleContinuousStop = () => {
+    continuousRef.current?.stop();
+    continuousRef.current = null;
+    setAnalyserNode(null);
+    setStatus(segments.length > 0 ? "done" : "idle");
   };
 
   const handleReset = () => {
@@ -173,6 +307,9 @@ export default function RecordPage() {
     setTranscript(null);
     setElapsed(0);
     setAudioLevel(0);
+    setSegments([]);
+    setAnalyserNode(null);
+    audioBlobRef.current = null;
   };
 
   const formatTime = (ms: number): string => {
@@ -191,11 +328,76 @@ export default function RecordPage() {
       <h1 className="mb-2 text-3xl font-bold text-zinc-900 dark:text-zinc-100">
         Record
       </h1>
-      <p className="mb-12 text-zinc-500 dark:text-zinc-400">
+      <p className="mb-6 text-zinc-500 dark:text-zinc-400">
         Tap the button to start capturing your thoughts.
       </p>
 
+      {/* Mode toggle + Language toggle */}
+      <div className="mb-8 flex flex-wrap items-center justify-center gap-3">
+        {/* Recording mode toggle */}
+        <div className="inline-flex items-center rounded-lg border border-zinc-200 p-0.5 dark:border-zinc-700">
+          <button
+            onClick={() => setMode("single")}
+            disabled={isRecording || isProcessing}
+            className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+              mode === "single"
+                ? "bg-indigo-600 text-white"
+                : "text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
+            } disabled:opacity-50`}
+          >
+            Single
+          </button>
+          <button
+            onClick={() => setMode("continuous")}
+            disabled={isRecording || isProcessing}
+            className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+              mode === "continuous"
+                ? "bg-indigo-600 text-white"
+                : "text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
+            } disabled:opacity-50`}
+          >
+            Continuous
+          </button>
+        </div>
+
+        {/* Language toggle */}
+        <div className="inline-flex items-center rounded-lg border border-zinc-200 p-0.5 dark:border-zinc-700">
+          <button
+            onClick={() => setLanguage("cs")}
+            disabled={isRecording || isProcessing}
+            className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+              language === "cs"
+                ? "bg-indigo-600 text-white"
+                : "text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
+            } disabled:opacity-50`}
+          >
+            CZ
+          </button>
+          <button
+            onClick={() => setLanguage("en")}
+            disabled={isRecording || isProcessing}
+            className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+              language === "en"
+                ? "bg-indigo-600 text-white"
+                : "text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
+            } disabled:opacity-50`}
+          >
+            EN
+          </button>
+        </div>
+      </div>
+
       <div className="flex flex-col items-center gap-8">
+        {/* Waveform visualizer */}
+        {(isRecording || isProcessing) && (
+          <div className="w-full rounded-xl border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-700 dark:bg-zinc-800/50">
+            <WaveformVisualizer
+              analyser={analyserNode}
+              isActive={status === "recording"}
+            />
+          </div>
+        )}
+
         {/* Record button */}
         <div className="relative">
           {/* Audio level ring */}
@@ -211,8 +413,12 @@ export default function RecordPage() {
           <button
             onClick={
               status === "idle" || status === "done" || status === "error"
-                ? handleStart
-                : handleStop
+                ? mode === "continuous"
+                  ? handleContinuousStart
+                  : handleStart
+                : mode === "continuous"
+                  ? handleContinuousStop
+                  : handleStop
             }
             disabled={isProcessing}
             className={`relative flex h-32 w-32 items-center justify-center rounded-full transition-all disabled:opacity-50 ${
@@ -258,14 +464,18 @@ export default function RecordPage() {
 
         {/* Status text + elapsed time */}
         <div className="flex flex-col items-center gap-1">
-          {isRecording && (
+          {isRecording && mode === "single" && (
             <p className="text-2xl font-mono font-semibold text-zinc-900 dark:text-zinc-100">
               {formatTime(elapsed)}
             </p>
           )}
           <p className="text-sm text-zinc-500 dark:text-zinc-400">
-            {status === "idle" && "Tap to start recording"}
-            {status === "recording" && "Recording... Tap to stop."}
+            {status === "idle" && (mode === "continuous"
+              ? "Tap to start continuous recording"
+              : "Tap to start recording")}
+            {status === "recording" && (mode === "continuous"
+              ? "Listening... segments auto-captured on speech."
+              : "Recording... Tap to stop.")}
             {status === "paused" && "Paused. Tap resume or stop."}
             {status === "uploading" && "Uploading audio..."}
             {status === "transcribing" && "Transcribing with Whisper..."}
@@ -275,8 +485,8 @@ export default function RecordPage() {
           </p>
         </div>
 
-        {/* Pause / Cancel controls during recording */}
-        {isRecording && (
+        {/* Pause / Cancel controls during single-shot recording */}
+        {isRecording && mode === "single" && (
           <div className="flex gap-3">
             <button
               onClick={handlePause}
@@ -290,6 +500,43 @@ export default function RecordPage() {
             >
               Cancel
             </button>
+          </div>
+        )}
+
+        {/* Continuous mode: segment feed */}
+        {mode === "continuous" && segments.length > 0 && (
+          <div className="w-full space-y-2 text-left">
+            <h3 className="text-sm font-medium text-zinc-500 dark:text-zinc-400">
+              Captured Segments ({segments.length})
+            </h3>
+            {segments.map((seg) => (
+              <div
+                key={seg.id}
+                className={`rounded-lg border p-3 text-sm ${
+                  seg.status === "transcribing"
+                    ? "border-amber-200 bg-amber-50 dark:border-amber-800 dark:bg-amber-950"
+                    : seg.status === "error"
+                      ? "border-red-200 bg-red-50 dark:border-red-800 dark:bg-red-950"
+                      : "border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900"
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-zinc-400 dark:text-zinc-500">
+                    {(seg.duration / 1000).toFixed(1)}s
+                  </span>
+                  {seg.status === "transcribing" && (
+                    <span className="text-xs text-amber-600 dark:text-amber-400">
+                      Transcribing...
+                    </span>
+                  )}
+                </div>
+                {seg.text && (
+                  <p className="mt-1 text-zinc-800 dark:text-zinc-200">
+                    {seg.text}
+                  </p>
+                )}
+              </div>
+            ))}
           </div>
         )}
 
@@ -334,8 +581,8 @@ export default function RecordPage() {
           </div>
         )}
 
-        {/* Transcript result */}
-        {transcript && (
+        {/* Transcript result (single mode) */}
+        {transcript && mode === "single" && (
           <div className="w-full rounded-xl border border-zinc-200 bg-white p-6 text-left dark:border-zinc-700 dark:bg-zinc-900">
             <div className="mb-3 flex items-center justify-between">
               <p className="text-sm font-medium text-zinc-500 dark:text-zinc-400">

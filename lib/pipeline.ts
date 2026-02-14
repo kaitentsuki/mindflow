@@ -6,6 +6,7 @@ import {
   type ExtractionResult,
 } from "./llm";
 import { generateEmbedding } from "./embeddings";
+import { createAndSendNotification, notificationExists } from "./notifications";
 
 const RELEVANCE_THRESHOLD = 0.7;
 
@@ -88,6 +89,20 @@ export async function processTranscript(
     connectionsFound = await findConnections(thought.id, userId);
   }
 
+  // Step 6: Notify about new connections
+  if (connectionsFound > 0) {
+    await notifyConnections(thought.id, userId, connectionsFound);
+  }
+
+  // Step 7: Auto-sync to Google Calendar if enabled and thought has deadline
+  if (thought.deadline) {
+    try {
+      await autoSyncCalendar(thought.id, userId);
+    } catch (err) {
+      console.error("[pipeline] Google Calendar auto-sync failed:", err);
+    }
+  }
+
   return {
     thoughtId: thought.id,
     relevant: isRelevant,
@@ -167,6 +182,11 @@ export async function processExistingThought(
     connectionsFound = await findConnections(thoughtId, thought.userId);
   }
 
+  // Step 5: Notify about new connections
+  if (connectionsFound > 0) {
+    await notifyConnections(thoughtId, thought.userId, connectionsFound);
+  }
+
   return {
     thoughtId,
     relevant: isRelevant,
@@ -225,4 +245,72 @@ async function findConnections(
   }
 
   return connections.length;
+}
+
+/**
+ * Send a notification when new connections are found for a thought.
+ */
+async function notifyConnections(
+  thoughtId: string,
+  userId: string,
+  connectionsFound: number
+): Promise<void> {
+  try {
+    const exists = await notificationExists(userId, thoughtId, "connection", 24);
+    if (exists) return;
+
+    const thought = await prisma.thought.findUnique({
+      where: { id: thoughtId },
+      select: { summary: true, cleanedText: true },
+    });
+
+    await createAndSendNotification({
+      userId,
+      thoughtId,
+      type: "connection",
+      title: `${connectionsFound} related thought${connectionsFound > 1 ? "s" : ""} found`,
+      body: thought?.summary || thought?.cleanedText.slice(0, 100),
+      url: `/library?highlight=${thoughtId}`,
+    });
+  } catch (err) {
+    console.error("[pipeline] Failed to send connection notification:", err);
+  }
+}
+
+/**
+ * Auto-sync a thought to Google Calendar if user has enabled auto-sync.
+ */
+async function autoSyncCalendar(
+  thoughtId: string,
+  userId: string
+): Promise<void> {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { preferences: true },
+  });
+  const prefs = (user?.preferences as Record<string, unknown>) || {};
+  if (!prefs.google_calendar_auto_sync) return;
+
+  const account = await prisma.account.findFirst({
+    where: { userId, provider: "google" },
+  });
+  if (!account?.access_token) return;
+
+  const thought = await prisma.thought.findUnique({
+    where: { id: thoughtId },
+  });
+  if (!thought?.deadline || thought.calendarEventId) return;
+
+  const { getCalendarClient, createCalendarEvent } = await import("./google-calendar");
+  const client = getCalendarClient(account.access_token, account.refresh_token || "");
+  const eventId = await createCalendarEvent(client, {
+    summary: thought.summary || thought.cleanedText,
+    deadline: thought.deadline.toISOString(),
+    description: thought.cleanedText,
+  });
+
+  await prisma.thought.update({
+    where: { id: thoughtId },
+    data: { calendarEventId: eventId },
+  });
 }
