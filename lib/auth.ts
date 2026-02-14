@@ -2,7 +2,6 @@ import { NextAuthOptions } from "next-auth";
 import CredentialsProvider from "next-auth/providers/credentials";
 import GoogleProvider from "next-auth/providers/google";
 import GitHubProvider from "next-auth/providers/github";
-import { PrismaAdapter } from "@next-auth/prisma-adapter";
 import bcrypt from "bcryptjs";
 import { prisma } from "./db";
 
@@ -16,7 +15,8 @@ const oauthProviders = [
 ];
 
 export const authOptions: NextAuthOptions = {
-  adapter: PrismaAdapter(prisma),
+  // No PrismaAdapter — it conflicts with CredentialsProvider in next-auth v4.
+  // OAuth account linking is handled manually in the signIn callback below.
   providers: [
     ...oauthProviders,
     CredentialsProvider({
@@ -62,49 +62,62 @@ export const authOptions: NextAuthOptions = {
     strategy: "jwt",
   },
   callbacks: {
-    async signIn({ user, account }) {
-      // OAuth account linking: if an OAuth provider email matches an existing user, link the account
+    async signIn({ user, account, profile }) {
+      // OAuth: create or link user + account in our DB
       if (account && account.provider !== "credentials" && user.email) {
-        const existingUser = await prisma.user.findUnique({
+        let existingUser = await prisma.user.findUnique({
           where: { email: user.email },
         });
 
-        if (existingUser) {
-          const existingAccount = await prisma.account.findUnique({
-            where: {
-              provider_providerAccountId: {
-                provider: account.provider,
-                providerAccountId: account.providerAccountId,
-              },
+        // Create user if new OAuth sign-in
+        if (!existingUser) {
+          existingUser = await prisma.user.create({
+            data: {
+              email: user.email,
+              name: user.name || profile?.name || user.email.split("@")[0],
+              emailVerified: new Date(),
             },
           });
-
-          if (!existingAccount) {
-            await prisma.account.create({
-              data: {
-                userId: existingUser.id,
-                type: account.type,
-                provider: account.provider,
-                providerAccountId: account.providerAccountId,
-                refresh_token: account.refresh_token,
-                access_token: account.access_token,
-                expires_at: account.expires_at,
-                token_type: account.token_type,
-                scope: account.scope,
-                id_token: account.id_token,
-                session_state: account.session_state as string | undefined,
-              },
-            });
-          }
-
-          // Mark email as verified for OAuth users
-          if (!existingUser.emailVerified) {
-            await prisma.user.update({
-              where: { id: existingUser.id },
-              data: { emailVerified: new Date() },
-            });
-          }
         }
+
+        // Link OAuth account if not already linked
+        const existingAccount = await prisma.account.findUnique({
+          where: {
+            provider_providerAccountId: {
+              provider: account.provider,
+              providerAccountId: account.providerAccountId,
+            },
+          },
+        });
+
+        if (!existingAccount) {
+          await prisma.account.create({
+            data: {
+              userId: existingUser.id,
+              type: account.type,
+              provider: account.provider,
+              providerAccountId: account.providerAccountId,
+              refresh_token: account.refresh_token,
+              access_token: account.access_token,
+              expires_at: account.expires_at,
+              token_type: account.token_type,
+              scope: account.scope,
+              id_token: account.id_token,
+              session_state: account.session_state as string | undefined,
+            },
+          });
+        }
+
+        // Mark email as verified for OAuth users
+        if (!existingUser.emailVerified) {
+          await prisma.user.update({
+            where: { id: existingUser.id },
+            data: { emailVerified: new Date() },
+          });
+        }
+
+        // Override the user.id so JWT gets the DB user ID (not the OAuth provider ID)
+        user.id = existingUser.id;
       }
 
       return true;
